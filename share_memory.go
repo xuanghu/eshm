@@ -28,6 +28,7 @@ type ShConfig struct {
 	Size   int //内存大小
 	Seq    int //消费序列号
 	Method int
+	Addr   uintptr
 }
 
 type Queue struct {
@@ -48,7 +49,7 @@ func NewShareMemory(c *ShConfig) (*ShareMemory, error) {
 		return nil, fmt.Errorf("syscall hmget error, err: %d\n", errCode)
 	}
 
-	shmAddr, _, errCode := syscall.Syscall(syscall.SYS_SHMAT, shmId, 0, 0)
+	shmAddr, _, errCode := syscall.Syscall(syscall.SYS_SHMAT, shmId, c.Addr, 0)
 	if errCode != 0 {
 		return nil, fmt.Errorf("syscall hmat error, err: %d\n", errCode)
 	}
@@ -74,12 +75,15 @@ func NewShareMemory(c *ShConfig) (*ShareMemory, error) {
 		Data:   data,
 	}
 
-	return &ShareMemory{
+	sm := &ShareMemory{
 		c:     c,
 		queue: queue,
 		addr:  shmAddr,
 		//status: Writer,
-	}, nil
+	}
+	sm.resetWriteLock()
+
+	return sm, nil
 }
 
 func GetShareMemory(c *ShConfig) (*ShareMemory, error) {
@@ -159,12 +163,15 @@ func GetShareMemory(c *ShConfig) (*ShareMemory, error) {
 		Data:   data,
 	}
 
-	return &ShareMemory{
+	sm := &ShareMemory{
 		c:     c,
 		queue: queue,
 		addr:  shmAddr,
 		//status: Reader,
-	}, nil
+	}
+	sm.resetReadLock()
+
+	return sm, nil
 }
 
 func (s *ShareMemory) Close() error {
@@ -177,6 +184,39 @@ func (s *ShareMemory) Close() error {
 		return fmt.Errorf("syscall hmdt error, err: %d\n", errCode)
 	}
 	return nil
+}
+
+//可能由于之前程序异常宕机导致写锁一直是锁住的,启动前检测写锁是否正常;若超时则重置
+func (s *ShareMemory) resetWriteLock() {
+Loop:
+	for {
+		select {
+		case <-time.After(10 * time.Second):
+			break Loop
+		default:
+			if !atomic.CompareAndSwapInt64(&s.queue.Header.WriteLock, 0, 1) {
+				break Loop
+			}
+		}
+	}
+	atomic.CompareAndSwapInt64(&s.queue.Header.WriteLock, 1, 0)
+}
+
+//可能由于之前程序异常宕机导致读锁一直是锁住的,启动前检测写锁是否正常;若超时则重置
+func (s *ShareMemory) resetReadLock() {
+	worker := &s.queue.Header.WorkerIndex[s.c.Seq]
+Loop:
+	for {
+		select {
+		case <-time.After(10 * time.Second):
+			break Loop
+		default:
+			if !atomic.CompareAndSwapInt64(&worker.ReadLock, 0, 1) {
+				break Loop
+			}
+		}
+	}
+	atomic.CompareAndSwapInt64(&worker.ReadLock, 1, 0)
 }
 
 func (s *ShareMemory) Append(buf []byte) error {
